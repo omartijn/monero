@@ -2574,7 +2574,7 @@ void Blockchain::on_new_tx_from_block(const cryptonote::transaction &tx)
 // This function overloads its sister function with
 // an extra value (hash of highest block that holds an output used as input)
 // as a return-by-reference.
-bool Blockchain::check_tx_inputs(transaction& tx, uint64_t& max_used_block_height, crypto::hash& max_used_block_id, tx_verification_context &tvc, bool kept_by_block)
+bool Blockchain::check_tx_inputs(transaction& tx, uint64_t& max_used_block_height, crypto::hash& max_used_block_id, tx_verification_context &tvc, bool kept_by_block) const
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
   CRITICAL_REGION_LOCAL(m_blockchain_lock);
@@ -2714,7 +2714,7 @@ bool Blockchain::have_tx_keyimges_as_spent(const transaction &tx) const
   }
   return false;
 }
-bool Blockchain::expand_transaction_2(transaction &tx, const crypto::hash &tx_prefix_hash, const std::vector<std::vector<rct::ctkey>> &pubkeys)
+bool Blockchain::expand_transaction_2(transaction &tx, const crypto::hash &tx_prefix_hash, const std::vector<std::vector<rct::ctkey>> &pubkeys) const
 {
   PERF_TIMER(expand_transaction_2);
   CHECK_AND_ASSERT_MES(tx.version == 2, false, "Transaction version is not 2");
@@ -2790,7 +2790,7 @@ bool Blockchain::expand_transaction_2(transaction &tx, const crypto::hash &tx_pr
 //        check_tx_input() rather than here, and use this function simply
 //        to iterate the inputs as necessary (splitting the task
 //        using threads, etc.)
-bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, uint64_t* pmax_used_block_height)
+bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, uint64_t* pmax_used_block_height) const
 {
   PERF_TIMER(check_tx_inputs);
   LOG_PRINT_L3("Blockchain::" << __func__);
@@ -2944,7 +2944,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
 
     if (tx.version == 1)
     {
-      if (threads > 1)
+      if (false && threads > 1)
       {
         // ND: Speedup
         // 1. Thread ring signature verification if possible.
@@ -3154,7 +3154,7 @@ bool Blockchain::check_tx_inputs(transaction& tx, tx_verification_context &tvc, 
 }
 
 //------------------------------------------------------------------
-void Blockchain::check_ring_signature(const crypto::hash &tx_prefix_hash, const crypto::key_image &key_image, const std::vector<rct::ctkey> &pubkeys, const std::vector<crypto::signature>& sig, uint64_t &result)
+void Blockchain::check_ring_signature(const crypto::hash &tx_prefix_hash, const crypto::key_image &key_image, const std::vector<rct::ctkey> &pubkeys, const std::vector<crypto::signature>& sig, uint64_t &result) const
 {
   std::vector<const crypto::public_key *> p_output_keys;
   p_output_keys.reserve(pubkeys.size());
@@ -3341,7 +3341,7 @@ bool Blockchain::is_tx_spendtime_unlocked(uint64_t unlock_time) const
 // This function locates all outputs associated with a given input (mixins)
 // and validates that they exist and are usable.  It also checks the ring
 // signature for each input.
-bool Blockchain::check_tx_input(size_t tx_version, const txin_to_key& txin, const crypto::hash& tx_prefix_hash, const std::vector<crypto::signature>& sig, const rct::rctSig &rct_signatures, std::vector<rct::ctkey> &output_keys, uint64_t* pmax_related_block_height)
+bool Blockchain::check_tx_input(size_t tx_version, const txin_to_key& txin, const crypto::hash& tx_prefix_hash, const std::vector<crypto::signature>& sig, const rct::rctSig &rct_signatures, std::vector<rct::ctkey> &output_keys, uint64_t* pmax_related_block_height) const
 {
   LOG_PRINT_L3("Blockchain::" << __func__);
 
@@ -3730,27 +3730,7 @@ leave:
     TIME_MEASURE_START(cc);
 
 #if defined(PER_BLOCK_CHECKPOINT)
-    if (!fast_check)
-#endif
-    {
-      // validate that transaction inputs and the keys spending them are correct.
-      tx_verification_context tvc;
-      if(!check_tx_inputs(tx, tvc))
-      {
-        MERROR_VER("Block with id: " << id  << " has at least one transaction (id: " << tx_id << ") with wrong inputs.");
-
-        //TODO: why is this done?  make sure that keeping invalid blocks makes sense.
-        add_block_as_invalid(bl, id);
-        MERROR_VER("Block with id " << id << " added as invalid because of wrong inputs in transactions");
-        MERROR_VER("tx_index " << tx_index << ", m_blocks_txs_check " << m_blocks_txs_check.size() << ":");
-        for (const auto &h: m_blocks_txs_check) MERROR_VER("  " << h);
-        bvc.m_verifivation_failed = true;
-        return_tx_to_pool(txs);
-        goto leave;
-      }
-    }
-#if defined(PER_BLOCK_CHECKPOINT)
-    else
+    if (fast_check)
     {
       // ND: if fast_check is enabled for blocks, there is no need to check
       // the transaction inputs, but do some sanity checks anyway.
@@ -3770,6 +3750,55 @@ leave:
     t_checktx += cc;
     fee_summary += fee;
     cumulative_block_weight += tx_weight;
+  }
+
+#if defined(PER_BLOCK_CHECKPOINT)
+  if (!fast_check)
+#endif
+  {
+    // check result for each transaction
+    std::vector<bool> results(txs.size(), true);
+
+    // get the threadpool and a waiter to wait for all transactions to complete
+    tools::threadpool& tpool = tools::threadpool::getInstance();
+    tools::threadpool::waiter waiter;
+
+    // process all transactions and do actual input validation
+    for (size_t i = 0; i < txs.size(); ++i)
+    {
+      auto result_iter = std::next(begin(results), i);
+      auto &tx = txs[i].first;
+      auto &tx_id = bl.tx_hashes[i];
+
+      auto tx_check = [this, result_iter, &id, &tx_id, &tx]() {
+        tx_verification_context tvc;
+        if(!check_tx_inputs(tx, tvc))
+        {
+          *result_iter = false;
+          MERROR_VER("Block with id: " << id << " has transaction (id: " << tx_id << ") with wrong inputs.");
+        }
+      };
+
+      // submit the check to the threadpool
+      tpool.submit(&waiter, tx_check);
+    }
+
+    // wait for all checks to complete
+    waiter.wait(&tpool);
+
+    // find the first transaction that failed
+    auto iter = std::find(begin(results), end(results), false);
+    if (iter != end(results))
+    {
+      //TODO: why is this done?  make sure that keeping invalid blocks makes sense.
+      add_block_as_invalid(bl, id);
+      MERROR_VER("Block with id " << id << " added as invalid because of wrong inputs in transactions");
+      MERROR_VER("tx_index " << std::distance(begin(results), iter) << ", m_blocks_txs_check " << m_blocks_txs_check.size() << ":");
+      for (const auto &h: m_blocks_txs_check) MERROR_VER("  " << h);
+      bvc.m_verifivation_failed = true;
+      return_tx_to_pool(txs);
+      goto leave;
+    }
   }
 
   m_blocks_txs_check.clear();
